@@ -51,6 +51,19 @@ namespace RunecraftHelper
         private const int ServerDataScanStart = 0x2580;     // drift-recovery scan window around +0x2618
         private const int ServerDataScanEnd = 0x26b0;
 
+        // Map/zone modifiers: the AreaInstance exposes its active mods as a std::vector<{ i32 StatsKey; i32 Value }>
+        // at +0x158 (begin) / +0x160 (end) — locale-free, Value = signed integer percent (RE 2026-07-03, obsidian
+        // poe2/MapMods, live-verified 0.5.4BHF3). The planner reads the Expedition placement-range / explosive-radius
+        // mods straight from here so they're applied automatically (no manual entry).
+        //
+        // NB: these StatsKeys are EMPIRICALLY confirmed against live zones — the numeric ids do NOT line up with the
+        // names in the dumped Stats.dat for 0.5.4b (the id space is misaligned/scrambled: e.g. the radius mod reads
+        // on key 13471 even though Stats.dat calls that row "explosives"). Confirm any new one by reading the vector
+        // in a zone that has the mod and matching the displayed %, not by the .dat name.
+        private const int AreaMapModsVecOffset = 0x158;
+        private const int StatMapExpeditionExplosiveRadiusPct = 13471;   // "Increased Expedition Explosive Radius" (confirmed: 36% zone)
+        private const int StatMapExpeditionPlacementRangePct = 13685;    // "Increased Expedition Explosive Placement Range" (confirmed: 32% zone)
+
         private const string ExpDetonatorPath = "Metadata/MiscellaneousObjects/Expedition/ExpeditionDetonator";
         private const string ExpExplosivePath = "Metadata/MiscellaneousObjects/Expedition/ExpeditionExplosive";
         private const string ExpMarkerPath = "Metadata/MiscellaneousObjects/Expedition/ExpeditionMarker";
@@ -212,10 +225,15 @@ namespace RunecraftHelper
         // placement reach AND blast than a Grand / Logbook one (base ~20). Earlier 108/35 were measured on Grand
         // (15-explosive) maps; the normal 90/28 came from maxing all 5 hops / edge-touching a marker on a 5-charge
         // map. Picked by ExpIsGrand(total) so each strategy uses its own physics.
-        private const float ExpBasePlacementDistanceGrand = 108f;   // grid
-        private const float ExpBasePlacementDistanceNormal = 90f;   // grid
-        private const float ExpBaseBlastRadiusGrand = 35f;          // grid
-        private const float ExpBaseBlastRadiusNormal = 28f;         // grid
+        // EXACT bases from Ghidra (BHF3): placement in ExpeditionExplosive_BuildPlacementPath (0x141ec19a0) =
+        // 0x6c/0x5a; blast radius in ExpeditionExplosive_ComputeBlastRadius (0x14178d1b0) = 0x25/0x1e. The
+        // Grand vs Normal branch is the same area-type test in both. Effective = base × (1 + mod%/100); the
+        // engine also adds +8×(nearby-uncovered) to the radius, so this floor is a safe (conservative) coverage
+        // value. (Radius was 35/28 from live measurement — 2 grid low vs the code floor 37/30.)
+        private const float ExpBasePlacementDistanceGrand = 108f;   // grid (0x6c)
+        private const float ExpBasePlacementDistanceNormal = 90f;   // grid (0x5a)
+        private const float ExpBaseBlastRadiusGrand = 37f;          // grid (0x25)
+        private const float ExpBaseBlastRadiusNormal = 30f;         // grid (0x1e)
 
         // The active base for the CURRENT map, chosen by the charge total (Grand vs normal). The Grand verdict is
         // only trusted from a CONFIRMED total — the controller (ServerData+0x2618) or the in-game HUD counter.
@@ -658,6 +676,11 @@ namespace RunecraftHelper
             var area = Core.States.InGameStateObject.CurrentAreaInstance;
             if (area == null) { this.expScanStatus = "no area"; return; }
 
+            // Auto-detect this map's Expedition mods (placement distance / explosive radius %) from the area's
+            // mod vector, every scan — replaces the old manual sliders. Per-map data; self-heals if it reads a
+            // frame late on entry.
+            this.ApplyExpeditionMapMods(area.Address);
+
             // Drop the persistent cache (targets + sticky detonator/charge anchor) only when the area
             // changes; within an area it accumulates so player movement never shrinks the routed set.
             if (area.AreaHash != this.expCachedAreaHash)
@@ -681,10 +704,8 @@ namespace RunecraftHelper
                 lock (this.expResultLock) { this.expPendingResult = null; }
                 this.expComputing = false;
 
-                // Map modifiers are per-map (read off the new map) — reset to 0 each area so they DON'T carry
-                // over, unlike the reward weights which persist. The player re-enters them for the new map.
-                this.Settings.ExpPlacementDistancePct = 0;
-                this.Settings.ExpBlastRadiusPct = 0;
+                // Map modifiers are per-map and auto-detected from the AreaInstance each scan
+                // (ApplyExpeditionMapMods), so nothing to carry over or reset here.
             }
 
             // Monolith ex-values reused from RunecraftHelper's own (patch-current) scan.
@@ -937,6 +958,47 @@ namespace RunecraftHelper
             this.expPlacedMax = this.expCtrlResolved ? rawPlaced : Math.Max(this.expPlacedMax, rawPlaced);
 
             this.expScanStatus = canWalk ? $"{this.expItems.Count} items" : $"{this.expItems.Count} items (no walkable grid)";
+        }
+
+        // Auto-detect this map's Expedition modifiers from the AreaInstance map-mods vector and feed them into the
+        // planner's placement-distance / blast-radius %s (replaces the old manual sliders). Vector = std::vector<
+        // { i32 StatsKey; i32 Value }> at areaAddr+0x158 (begin) / +0x160 (end); Value is a signed integer percent.
+        // Absent stat ⇒ 0 (no mod). Read failure ⇒ values left untouched (no flicker); a genuinely empty vector ⇒ 0.
+        // Keys are empirically confirmed (see constants) — the dumped Stats.dat names are misaligned for this build.
+        private void ApplyExpeditionMapMods(IntPtr areaAddr)
+        {
+            if (areaAddr == IntPtr.Zero || this.processHandle == IntPtr.Zero) return;
+
+            var head = new byte[16];
+            if (!ReadProcessMemory(this.processHandle, areaAddr + AreaMapModsVecOffset, head, (uint)head.Length, out _))
+                return;
+
+            long begin = BitConverter.ToInt64(head, 0);
+            long end = BitConverter.ToInt64(head, 8);
+            if (begin == 0 && end == 0) { this.Settings.ExpPlacementDistancePct = 0; this.Settings.ExpBlastRadiusPct = 0; return; }
+
+            ulong b = (ulong)begin;
+            if (b < 0x10000 || b > 0x7FFFFFFFFFFFul) return;
+            long span = end - begin;
+            if (span <= 0 || (span % 8) != 0 || span > 0x8000) return;   // 0x8000 ⇒ 4096-entry sanity cap
+
+            var buf = new byte[span];
+            if (!ReadProcessMemory(this.processHandle, (IntPtr)begin, buf, (uint)buf.Length, out _)) return;
+
+            int distancePct = 0, radiusPct = 0;
+            for (int off = 0; off + 8 <= buf.Length; off += 8)
+            {
+                int statId = BitConverter.ToInt32(buf, off);
+                int value = BitConverter.ToInt32(buf, off + 4);
+                switch (statId)
+                {
+                    case StatMapExpeditionPlacementRangePct: distancePct += value; break;
+                    case StatMapExpeditionExplosiveRadiusPct: radiusPct += value; break;
+                }
+            }
+
+            this.Settings.ExpPlacementDistancePct = distancePct;
+            this.Settings.ExpBlastRadiusPct = radiusPct;
         }
 
         // Debug dump: list every relic's mods split into Upside (+) / Downside (−) by the self-documenting mod-name
@@ -3547,13 +3609,13 @@ namespace RunecraftHelper
                 if (this.expLastPhase.Length > 0) ImGui.TextDisabled(this.expLastPhase);
             }
 
-            ImGui.SeparatorText("Map modifiers");
-            ImGui.SliderInt("Placement dist +%", ref s.ExpPlacementDistancePct, 0, 100);
-            ImGui.SliderInt("Blast radius +%", ref s.ExpBlastRadiusPct, 0, 100);
+            ImGui.SeparatorText("Map modifiers (auto)");
+            ImGui.Text($"Placement dist +%: {s.ExpPlacementDistancePct}    Blast radius +%: {s.ExpBlastRadiusPct}");
+            ImGui.TextDisabled("auto-detected from the map's Expedition modifiers");
             float effDist = this.ExpBasePlacementDistance() * (1f + (s.ExpPlacementDistancePct / 100f));
             float effRadius = this.ExpBaseBlastRadius() * (1f + (s.ExpBlastRadiusPct / 100f));
             ImGui.TextDisabled($"→ distance {effDist:F0} grid · radius {effRadius:F0} grid · " +
-                               $"{(this.ExpCurrentIsGrand() ? "Grand" : "normal")} base  (reset each map)");
+                               $"{(this.ExpCurrentIsGrand() ? "Grand" : "normal")} base  (auto each map)");
 
             ImGui.SeparatorText("Targets to route");
 
