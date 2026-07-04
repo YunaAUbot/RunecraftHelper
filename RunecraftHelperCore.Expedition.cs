@@ -1869,7 +1869,14 @@ namespace RunecraftHelper
                 }
                 else if (t.Kind == ExpKind.Marker)
                 {
-                    w = this.ExpMarkerTierWeight(ExpMarkerPoleOffset(t), markerBaseline, out _);
+                    // NORMAL: reward flags are valued by pole HEIGHT (logbook/gold/magic/white tiers) — the whole
+                    // height-tier + Sentinel logic only makes sense here. GRAND: those same flags are INERT (their
+                    // drop is completely different / useless), so height weights must NOT leak in and send the route
+                    // chasing them. In Grand, value markers by their reward-icon profile instead (reward-chest icons
+                    // get their profile weight; inert flags fall to the catch-all default and stay negligible).
+                    w = inp.MarkerCoverageMode
+                        ? this.ExpMarkerTierWeight(ExpMarkerPoleOffset(t), markerBaseline, out _)
+                        : this.ExpEffectiveRewardWeight(t.Info);
                 }
                 else if (t.Kind == ExpKind.Sentinel)
                 {
