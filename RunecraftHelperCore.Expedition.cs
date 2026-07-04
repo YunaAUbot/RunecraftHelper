@@ -3166,6 +3166,10 @@ namespace RunecraftHelper
             // (camera-nearer) ring rendered LARGER than the on-ground blast actually is. Sampling ground height per
             // point drops the ring onto the terrain and lets it follow slopes, so its size reads correctly.
             float effRadius = this.ExpBaseBlastRadius() * (1f + (this.Settings.ExpBlastRadiusPct / 100f));
+            // VISUAL-ONLY shrink: the ground-plane camera projection reads a touch larger than the game's in-game
+            // coverage circle, so draw the ring at 0.95× the true blast radius to match by eye. Routing/coverage keep
+            // the true effRadius (a charge still grabs exactly what the planner counted) — this only affects the ring.
+            float drawRadius = effRadius * 0.95f;
             var heights = Core.States.InGameStateObject.CurrentAreaInstance?.GridHeightData;
             float GroundZ(float gx, float gy)
             {
@@ -3181,8 +3185,8 @@ namespace RunecraftHelper
             for (int i = 0; i <= Seg; i++)
             {
                 double a = 2.0 * Math.PI * i / Seg;
-                float gx = rp.TargetGrid.X + (effRadius * (float)Math.Cos(a));
-                float gy = rp.TargetGrid.Y + (effRadius * (float)Math.Sin(a));
+                float gx = rp.TargetGrid.X + (drawRadius * (float)Math.Cos(a));
+                float gy = rp.TargetGrid.Y + (drawRadius * (float)Math.Sin(a));
                 var ring = world.WorldToScreen(new StdTuple3D<float>
                 {
                     X = gx * ExpWorldPerGrid,
