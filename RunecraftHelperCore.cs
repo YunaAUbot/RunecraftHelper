@@ -9,6 +9,7 @@ namespace RunecraftHelper
     using GameHelper;
     using GameHelper.Localization;
     using GameHelper.Plugin;
+    using GameHelper.Plugin.Price;
     using GameHelper.RemoteEnums;
     using GameHelper.RemoteObjects.Components;
     using GameHelper.RemoteObjects.States.InGameStateObjects;
@@ -114,32 +115,8 @@ namespace RunecraftHelper
         private int handlePid;
 
         private readonly List<Recipe> recipes = new();
-        private readonly PriceCache priceCache = new();
-        private DateTime nextAutoRefreshCheckUtc = DateTime.MinValue;
+        private ProviderPricingPass pricing = ProviderPricingPass.Capture(() => null);
 
-        // Throttles the league-list staleness check (same one-minute tick as the price check).
-        private DateTime nextLeagueCheckUtc = DateTime.MinValue;
-
-        // FetchedUtc of the league list the last time we evaluated it — a change means a fresh list
-        // arrived, which is the only moment "the saved league disappeared" can newly become true.
-        private DateTime lastSeenLeagueListUtc = DateTime.MinValue;
-
-        // Set when the plugin moved itself off a league that vanished from poe.ninja's economyLeagues,
-        // so the settings pane can say so instead of silently swapping the user's league. Stored as the
-        // two raw names (not a formatted sentence) so the note follows the UI language at draw time.
-        private string leagueNoteFrom = string.Empty;
-        private string leagueNoteTo = string.Empty;
-
-        // {localizedName → (metaId, ddsArt)}, built once per game session from BaseItemTypes.
-        // metaId  = BaseItemType.Id last segment  — matches poe.ninja's tiered key for shared-icon
-        //           families (Regal: …/…2/…3).
-        // ddsArt  = .dds art filename             — matches poe.ninja's image-id for distinct-icon
-        //           families (Jeweller's: …01/02/03) where the game's BaseItemType.Id diverges.
-        // The price lookup tries metaId first, then ddsArt (see TryGetRecipePrice).
-        private Dictionary<string, (string MetaId, string DdsArt)> nameToArtId = new(StringComparer.Ordinal);
-        // While the dict is empty, throttle the (BFS-heavy) build attempts so a table that can't be
-        // located doesn't re-run the pointer walk every frame. Reset on process change.
-        private DateTime nameToArtNextTryUtc = DateTime.MinValue;
 
         // {BaseItemType.Id (full meta path) → LOCALIZED display name}, built once per session from the
         // in-memory BaseItemTypes table (row Id @+0x00, localized Name @+0x20). Used by the Monolith
@@ -151,11 +128,6 @@ namespace RunecraftHelper
         private DateTime metaToLocalNextTryUtc = DateTime.MinValue;
 
         private string SettingPathname => Path.Join(this.DllDirectory, "config", "settings.txt");
-        private string PriceCachePathname => Path.Join(this.DllDirectory, "config", "prices.json");
-
-        // poe.ninja's economyLeagues list (see NinjaLeagues). League-independent by design — the file
-        // name must NOT carry a league, it caches the list of leagues itself.
-        private string LeagueCachePathname => Path.Join(this.DllDirectory, "config", "leagues.json");
 
         // Localization: JSON dictionaries in <plugin>/Localization/<lang-code>.json, keyed by the stable keys
         // used at the call sites. Resolves against GameHelper's selected UI language (OverlayLocalization.
@@ -182,19 +154,7 @@ namespace RunecraftHelper
                                 ?? new RunecraftHelperSettings();
             }
 
-            // League list first: the price fetch below needs a league name that still exists, and the
-            // settings combo should have content on the very first frame.
-            if (!NinjaLeagues.TryLoadFromDisk(this.LeagueCachePathname, NinjaLeagues.DefaultTtlHours))
-            {
-                NinjaLeagues.StartRefresh(this.LeagueCachePathname);
-            }
-
-            this.MaybeAdoptIndexedLeague();
-
-            var fresh = this.priceCache.TryLoadFromDisk(
-                this.PriceCachePathname, this.Settings.CacheTtlMinutes, this.Settings.League);
-            if (!fresh)
-                this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
+            this.pricing = ProviderPricingPass.Capture(() => PriceProviderRegistry.Current);
         }
 
         public override void OnDisable() => this.ResetHandle();
@@ -202,7 +162,6 @@ namespace RunecraftHelper
         public override void SaveSettings()
         {
             Directory.CreateDirectory(Path.GetDirectoryName(this.SettingPathname)!);
-            this.Settings.LastSyncUtc = this.priceCache.LastSyncUtc;
             File.WriteAllText(this.SettingPathname, JsonConvert.SerializeObject(this.Settings, Formatting.Indented));
         }
 
@@ -216,45 +175,32 @@ namespace RunecraftHelper
             ImGui.Spacing();
             ImGui.Separator();
 
-            if(ImGui.CollapsingHeader(this.Loc.Title("settings.poeninja", "poe.ninja settings", "rh_poeninja"))) {
-                this.DrawLeaguePicker();
-                ImGui.SliderInt(this.L("settings.refresh_interval", "Refresh interval (min)"), ref this.Settings.CacheTtlMinutes, 5, 60);
-
-                // poe.ninja price sync status + manual refresh — common (the price overlay is shared by all features).
-                ImGui.Spacing();
-                var status = this.priceCache.Status;
-                var lastSync = this.priceCache.LastSyncUtc;
-                string statusText = status switch
+            if (ImGui.CollapsingHeader(this.Loc.Title("settings.price_provider", "Shared price provider", "rh_price_provider")))
+            {
+                var pricing = ProviderPricingPass.Capture(() => PriceProviderRegistry.Current);
+                if (pricing.TryGetStatus(out var status))
                 {
-                    PriceSyncStatus.Syncing => this.L("status.syncing", "syncing…"),
-                    PriceSyncStatus.Ready => lastSync == DateTime.MinValue
-                        ? this.L("status.ready_nodata", "ready (no data yet)")
-                        : this.LF("status.updated_ago", "updated {0} ago", FormatRelative(lastSync)),
-                    PriceSyncStatus.Error => this.LF("status.error", "error: {0}", this.priceCache.LastError),
-                    _ => this.L("status.idle", "idle"),
-                };
+                    var state = status.IsFetching
+                        ? this.L("status.syncing", "syncing...")
+                        : this.L("status.ready", "ready");
+                    ImGui.Text(this.LF("status.label", "Status: {0}", state));
+                    ImGui.Text(this.LF("status.provider", "Provider: {0} ({1})", status.ProviderName, status.Source));
+                    ImGui.Text(this.LF("status.league", "League: {0}", status.League));
+                    ImGui.Text(this.LF("status.items_cached", "Items cached: {0}", status.ItemCount));
+                    if (status.LastFetchUtc != DateTimeOffset.MinValue)
+                    {
+                        ImGui.Text(this.LF("status.updated_ago", "Updated {0} ago", FormatRelative(status.LastFetchUtc.UtcDateTime)));
+                    }
 
-                ImGui.Text(this.LF("status.label", "Status: {0}", statusText));
-
-                // The single most common pricing failure: a league name the API doesn't know (typically a
-                // web slug), which answers 200 with an empty body. PriceCache reports it verbatim (it has
-                // no localization access), so the localized explanation lives here.
-                if (status == PriceSyncStatus.Error &&
-                    this.priceCache.LastError.Contains("returned 0 rows", StringComparison.Ordinal))
-                {
-                    ImGui.TextWrapped(this.L("status.zero_rows",
-                        "poe.ninja answered, but has no rows for this league. Check the league name: it must be\n" +
-                        "the API name with spaces (\"Runes of Aldur\"), not the web slug (\"runesofaldur\")."));
+                    ImGui.BeginDisabled(status.IsFetching);
+                    if (ImGui.Button(this.L("settings.refresh_now", "Refresh now"))) pricing.RequestRefresh();
+                    ImGui.EndDisabled();
                 }
-
-                ImGui.Text(this.LF("status.items_cached", "Items cached: {0}", this.priceCache.PriceCount));
-                if (this.priceCache.DivineToExaltedRate > 0)
-                    ImGui.Text(this.LF("status.divine_rate", "1 Divine = {0:F2} Exalted", this.priceCache.DivineToExaltedRate));
-
-                ImGui.BeginDisabled(status == PriceSyncStatus.Syncing);
-                if (ImGui.Button(this.L("settings.refresh_now", "Refresh now")))
-                    this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
-                ImGui.EndDisabled();
+                else
+                {
+                    ImGui.TextColored(new Vector4(1f, .45f, .25f, 1f),
+                        this.L("status.provider_unavailable", "NinjaPricer is unavailable. Enable it to show prices."));
+                }
             }
 
             ImGui.Spacing();
@@ -410,128 +356,6 @@ namespace RunecraftHelper
             ImGui.EndTabBar();
         }
 
-        // League selector. Filled from poe.ninja's economyLeagues (NinjaLeagues), grouped by the
-        // `hardcore` flag, with a free-text escape hatch for league-launch day (when the new league
-        // isn't in index-state yet).
-        //
-        // Deliberately NOT ImGuiHelper.IEnumerableComboBox: that helper renders entries as
-        // "0:Runes of Aldur" (index prefix), which is a core debug idiom, not user-facing UI.
-        // Every label goes through Loc.Label/a literal "##id" so the ImGui item ID stays stable when
-        // the GameHelper UI language changes.
-        private void DrawLeaguePicker()
-        {
-            if (this.Settings.UseCustomLeague)
-            {
-                if (ImGui.InputText(this.Loc.Label("settings.league", "League", "RhLeagueInput"), ref this.Settings.League, 64))
-                {
-                    this.Settings.LeaguePinned = true;
-                }
-
-                if (ImGui.IsItemDeactivatedAfterEdit())
-                {
-                    this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
-                }
-
-                ImGui.TextDisabled(this.L("settings.custom_league_hint",
-                    "Enter poe.ninja's API name, with spaces (\"Runes of Aldur\") — not the web slug\n" +
-                    "(\"runesofaldur\"), which the API answers with an empty result."));
-            }
-            else
-            {
-                // Preview is the RAW saved value, so the user sees what will be sent even before the
-                // list has loaded (or when the saved league isn't in it at all).
-                var softcore = new List<NinjaLeague>();
-                var hardcore = new List<NinjaLeague>();
-                foreach (var name in NinjaLeagues.ComboItems(this.Settings.League))
-                {
-                    var lg = NinjaLeagues.Resolve(name);
-                    (lg.Hardcore ? hardcore : softcore).Add(lg);
-                }
-
-                void Group(string header, List<NinjaLeague> items)
-                {
-                    if (items.Count == 0)
-                    {
-                        return;
-                    }
-
-                    ImGui.SeparatorText(header);
-                    foreach (var lg in items)
-                    {
-                        var selected = string.Equals(lg.Name, this.Settings.League, StringComparison.OrdinalIgnoreCase);
-                        if (ImGui.IsWindowAppearing() && selected)
-                        {
-                            ImGui.SetScrollHereY();
-                        }
-
-                        if (ImGui.Selectable($"{NinjaLeagues.LabelOf(lg)}##lg_{lg.Name}", selected) && !selected)
-                        {
-                            this.Settings.League = lg.Name;
-                            this.Settings.LeaguePinned = true;
-                            this.leagueNoteFrom = string.Empty;
-                            this.leagueNoteTo = string.Empty;
-                            this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
-                        }
-                    }
-                }
-
-                if (ImGui.BeginCombo(this.Loc.Label("settings.league", "League", "RhLeagueCombo"), this.Settings.League))
-                {
-                    Group(this.L("settings.league_softcore", "Softcore"), softcore);
-                    Group(this.L("settings.league_hardcore", "Hardcore"), hardcore);
-                    ImGui.EndCombo();
-                }
-
-                ImGui.TextDisabled(this.L("settings.league_hint",
-                    "Prices are fetched for exactly this poe.ninja league."));
-            }
-
-            ImGui.Checkbox(
-                this.Loc.Label("settings.custom_league", "Type the league name manually", "RhCustomLeague"),
-                ref this.Settings.UseCustomLeague);
-
-            var listStatus = NinjaLeagues.Status;
-            ImGui.BeginDisabled(listStatus == PriceSyncStatus.Syncing);
-            if (ImGui.Button(this.Loc.Label("settings.refresh_leagues", "Refresh league list", "RhRefreshLeagues")))
-            {
-                NinjaLeagues.StartRefresh(this.LeagueCachePathname);
-            }
-
-            ImGui.EndDisabled();
-
-            string listText;
-            if (listStatus == PriceSyncStatus.Syncing)
-            {
-                listText = this.L("settings.leagues_loading", "loading league list…");
-            }
-            else if (listStatus == PriceSyncStatus.Error)
-            {
-                listText = NinjaLeagues.IsLoaded
-                    ? this.LF("settings.leagues_offline_cached", "offline — using cached list ({0} old)", FormatRelative(NinjaLeagues.FetchedUtc))
-                    : this.L("settings.leagues_offline_builtin", "offline — using built-in list");
-            }
-            else if (NinjaLeagues.IsLoaded)
-            {
-                listText = this.LF("settings.leagues_ok", "{0} leagues, updated {1} ago", NinjaLeagues.All.Count, FormatRelative(NinjaLeagues.FetchedUtc));
-            }
-            else
-            {
-                listText = this.L("settings.leagues_offline_builtin", "offline — using built-in list");
-            }
-
-            ImGui.SameLine();
-            ImGui.TextDisabled(listText);
-
-            if (!string.IsNullOrEmpty(this.leagueNoteTo))
-            {
-                ImGui.TextWrapped(this.LF(
-                    "settings.league_adopted",
-                    "League \"{0}\" is gone from poe.ninja; switched to \"{1}\".",
-                    this.leagueNoteFrom,
-                    this.leagueNoteTo));
-            }
-        }
-
         public override void DrawUI()
         {
             if (Core.States.GameCurrentState != GameStateTypes.InGameState)
@@ -540,7 +364,7 @@ namespace RunecraftHelper
                 return;
             }
 
-            this.MaybeAutoRefreshPrices();
+            this.pricing = ProviderPricingPass.Capture(() => PriceProviderRegistry.Current);
 
             // When neither the game nor GameHelper is the foreground window the game hides its
             // panels; our overlay must follow suit, otherwise the price text floats over the
@@ -594,7 +418,6 @@ namespace RunecraftHelper
                 return;
             }
 
-            this.BuildNameToArtIfNeeded(panel);
             this.ReadVisibleRecipes(panel);
             if (this.recipes.Count == 0) return;
 
@@ -744,56 +567,6 @@ namespace RunecraftHelper
             }
         }
 
-        // ── Reward art-id dictionary (localized name → language-independent art-id) ──────────
-
-        // Build {localizedName → (metaId, ddsArt)} from the game's MAIN BaseItemTypes table, once per
-        // session (loaded globally, stable until the game restarts). The table is located DIRECTLY (no
-        // longer via the recipe table's reward FK, whose row layout drifts between patches and silently
-        // emptied this dict). Throttled while empty so the BFS doesn't run every frame.
-        private void BuildNameToArtIfNeeded(IntPtr panel)
-        {
-            if (this.nameToArtId.Count > 0) return;
-            var now = DateTime.UtcNow;
-            if (now < this.nameToArtNextTryUtc) return;
-            this.nameToArtNextTryUtc = now.AddSeconds(2);
-
-            // The recipe handle is reliably reachable from the panel and sits in the same dat-table
-            // registry as BaseItemTypes, so it serves as a second BFS root to reach the latter.
-            var recipeHandle = this.FindRecipeTableHandle(panel);
-            var bitTable = this.FindBaseItemTypesHandle(panel, recipeHandle);
-            if (bitTable == IntPtr.Zero) return;
-
-            var bitVec = this.ReadPtr(bitTable + TableRowsVectorOffset);
-            var bitBegin = this.ReadPtr(bitVec);
-            var bitEnd = this.ReadPtr(bitVec + 8);
-            if (bitBegin == IntPtr.Zero || (long)bitEnd <= (long)bitBegin) return;
-            long bitCount = ((long)bitEnd - (long)bitBegin) / BaseItemTypeStride;
-            if (bitCount <= 0 || bitCount > 200000) return;
-
-            var dict = new Dictionary<string, (string, string)>(StringComparer.Ordinal);
-            for (long j = 0; j < bitCount; j++)
-            {
-                var row = bitBegin + (nint)(j * BaseItemTypeStride);
-                var name = this.ReadUtf16Z(this.ReadPtr(row + BaseItemTypeNameOffset), 64);
-                if (name.Length < 2) continue;
-                // metaId: BaseItemType.Id's last meta-path segment (e.g. "CurrencyUpgradeMagicToRare2").
-                // Its trailing digit encodes the currency tier for shared-icon families (Regal …/…2/…3).
-                var metaId = LastMetaSegment(this.ReadUtf16Z(this.ReadPtr(row + BaseItemTypeIdOffset), 128));
-                // ddsArt: the .dds art filename (= poe.ninja's image-id). Distinct per tier for families
-                // whose BaseItemType.Id diverges from the art name (Jeweller's "…01/02/03"). row+0x78 →
-                // sub-object, +0x08 → "Art/2DItems/.../<ArtId>.dds".
-                var artSub = this.ReadPtr(row + BaseItemTypeArtOffset);
-                var ddsArt = artSub == IntPtr.Zero
-                    ? string.Empty
-                    : ArtIdFromDdsPath(this.ReadUtf16Z(this.ReadPtr(artSub + ArtSubPathOffset), 128));
-                if (metaId.Length == 0 && ddsArt.Length == 0) continue;
-                // Key by the RAW localized name (trimmed). NOT PriceCache.Normalize — that keeps only
-                // a-z0-9 and would collapse every Cyrillic/CJK name to the empty string.
-                dict[name.Trim()] = (metaId, ddsArt);
-            }
-
-            if (dict.Count > 0) this.nameToArtId = dict;
-        }
 
         // Walk a pointer graph (BFS) to a loaded dat-file handle whose path satisfies `pathMatch`: a heap
         // object whose +0x00 is an in-module vtable and whose +0x08 points to its path string. The vtable
@@ -835,11 +608,6 @@ namespace RunecraftHelper
             return IntPtr.Zero;
         }
 
-        // Main Expedition2Recipes dat handle (path ends ".../Balance/Expedition2Recipes.dat") — excludes
-        // the per-language overlay (".../Russian/...") and ".datc64" caches, whose rows lack the schema.
-        private IntPtr FindRecipeTableHandle(IntPtr panel) =>
-            this.FindDatHandle(panel, IntPtr.Zero,
-                s => s.EndsWith("Balance/Expedition2Recipes.dat", StringComparison.Ordinal));
 
         // Main BaseItemTypes dat handle (path ends ".../Balance/BaseItemTypes.dat"). `recipeHandle` is a
         // second BFS root (same dat registry) for when the table isn't reachable from the panel alone.
@@ -869,90 +637,6 @@ namespace RunecraftHelper
                 sb.Append(c);
             }
             return sb.ToString();
-        }
-
-        // ── Price refresh polling ─────────────────────────────────────────
-
-        // Cheap once-a-minute poll: if the cache is older than the configured TTL and no sync is
-        // already in flight, kick one off. The first refresh after OnEnable is initiated there;
-        // this only handles long-lived sessions where the TTL eventually expires.
-        private void MaybeAutoRefreshPrices()
-        {
-            var now = DateTime.UtcNow;
-            if (now < this.nextAutoRefreshCheckUtc) return;
-            this.nextAutoRefreshCheckUtc = now.AddMinutes(1);
-
-            // League list ages on its own (12h) clock, independent of the price TTL.
-            if (now >= this.nextLeagueCheckUtc)
-            {
-                this.nextLeagueCheckUtc = now.AddMinutes(1);
-                var wasLoaded = NinjaLeagues.IsLoaded;
-                var listAt = NinjaLeagues.FetchedUtc;
-
-                if (NinjaLeagues.IsStale && NinjaLeagues.Status != PriceSyncStatus.Syncing)
-                {
-                    NinjaLeagues.StartRefresh(this.LeagueCachePathname);
-                }
-                else if (NinjaLeagues.IsLoaded &&
-                         (!wasLoaded || listAt != this.lastSeenLeagueListUtc) &&
-                         !this.Settings.LeaguePinned &&
-                         !this.Settings.UseCustomLeague &&
-                         !NinjaLeagues.Contains(this.Settings.League))
-                {
-                    // The list just changed under us and the saved league is no longer offered.
-                    this.MaybeAdoptIndexedLeague();
-                }
-
-                this.lastSeenLeagueListUtc = NinjaLeagues.FetchedUtc;
-            }
-
-            if (this.priceCache.Status == PriceSyncStatus.Syncing) return;
-            var ttl = TimeSpan.FromMinutes(Math.Max(1, this.Settings.CacheTtlMinutes));
-            if (this.priceCache.LastSyncUtc != DateTime.MinValue && now - this.priceCache.LastSyncUtc < ttl) return;
-
-            this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
-        }
-
-        // One-time, opt-out-able migration: if the user never picked a league themselves and the one
-        // we have saved is gone from poe.ninja's economyLeagues (new league launched), move to the
-        // league poe.ninja itself defaults to and re-fetch prices. A user with a league that still
-        // exists only gets LeaguePinned set — nothing else changes for them.
-        //
-        // `Indexed` is used ONLY here (default picking); it does not mean "has economy data".
-        private void MaybeAdoptIndexedLeague()
-        {
-            if (this.Settings.LeaguePinned || this.Settings.UseCustomLeague)
-            {
-                return;
-            }
-
-            // Built-in fallback only (no network, no cache): we can't tell whether the saved league is
-            // gone or merely unseen, so do nothing and retry on a later tick.
-            if (!NinjaLeagues.IsLoaded)
-            {
-                return;
-            }
-
-            this.lastSeenLeagueListUtc = NinjaLeagues.FetchedUtc;
-
-            if (NinjaLeagues.Contains(this.Settings.League))
-            {
-                this.Settings.LeaguePinned = true;
-                return;
-            }
-
-            if (!NinjaLeagues.TryPickDefault(out var picked) ||
-                string.Equals(picked, this.Settings.League, StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            var previous = this.Settings.League;
-            this.Settings.League = picked;
-            this.Settings.LeaguePinned = true;
-            this.leagueNoteFrom = previous;
-            this.leagueNoteTo = picked;
-            this.priceCache.StartRefresh(this.Settings.League, this.PriceCachePathname);
         }
 
         // ── Drawing (overlay) ─────────────────────────────────────────────
@@ -1397,6 +1081,10 @@ namespace RunecraftHelper
         //   4) localized name    — English clients / unmapped.
         private bool TryGetRecipePrice(in Recipe r, out double unit)
         {
+            // The shared provider indexes exact English names more precisely than shared-icon art ids.
+            // Prefer the catalog name and include the internal id in the same query before art fallbacks.
+            if (this.TryPriceByMetaEnglish(r.MetaId, out unit)) return true;
+
             // Uncut gems (Skill/Support/Spirit) reuse ONE icon per family; the level is the metaId's
             // trailing digits with no "Level" marker. Try dds-art + level first (e.g. "UncutSkillGemBuff"
             // + 19), then fall back to the metaId→English-name path, which is level-SPECIFIC (the catalog
@@ -1408,24 +1096,23 @@ namespace RunecraftHelper
                 int gemLevel = UncutGemLevel(r.MetaId);
                 if (gemLevel < 0) { unit = 0; return false; }   // base/quest variant — not tradable
                 if (!string.IsNullOrEmpty(r.DdsArt) &&
-                    this.priceCache.TryGetPriceByArtId(r.DdsArt + gemLevel.ToString(), out unit) && unit > 0)
+                    this.pricing.TryGetPriceByArtId(r.DdsArt + gemLevel.ToString(), out unit) && unit > 0)
                     return true;
-                if (this.TryPriceByMetaEnglish(r.MetaId, out unit)) return true;
                 unit = 0;
                 return false;
             }
 
-            if (!string.IsNullOrEmpty(r.MetaId) && this.priceCache.TryGetPriceByArtId(r.MetaId, out unit) && unit > 0)
+            if (!string.IsNullOrEmpty(r.MetaId) && this.pricing.TryGetPriceByArtId(r.MetaId, out unit) && unit > 0)
                 return true;
 
             int level = LevelFromMetaId(r.MetaId);
             if (level >= 0)
             {
                 if (!string.IsNullOrEmpty(r.DdsArt) &&
-                    this.priceCache.TryGetPriceByArtId(r.DdsArt + level.ToString(), out unit) && unit > 0)
+                    this.pricing.TryGetPriceByArtId(r.DdsArt + level.ToString(), out unit) && unit > 0)
                     return true;
             }
-            else if (!string.IsNullOrEmpty(r.DdsArt) && this.priceCache.TryGetPriceByArtId(r.DdsArt, out unit) && unit > 0)
+            else if (!string.IsNullOrEmpty(r.DdsArt) && this.pricing.TryGetPriceByArtId(r.DdsArt, out unit) && unit > 0)
             {
                 return true;
             }
@@ -1433,9 +1120,7 @@ namespace RunecraftHelper
             // English-name fallback: poe.ninja keys some items (notably Expedition logbooks) by display
             // NAME, not metaId/dds. The live panel only gives the LOCALIZED name, so resolve the reward's
             // ENGLISH name from the offline catalog (by metaId) and price by that — language-independent.
-            if (this.TryPriceByMetaEnglish(r.MetaId, out unit)) return true;
-
-            if (this.priceCache.TryGetExaltedPrice(r.Name, out unit) && unit > 0)
+            if (this.pricing.TryGetExaltedPrice(r.Name, out unit) && unit > 0)
                 return true;
             unit = 0;
             return false;
@@ -1450,48 +1135,43 @@ namespace RunecraftHelper
             if (string.IsNullOrEmpty(metaId)) return false;
             this.BuildMetaIdToEnglishIfNeeded();
             return this.metaIdToEnglish.TryGetValue(metaId, out var eng) &&
-                   this.priceCache.TryGetExaltedPrice(eng, out unit) && unit > 0;
+                   this.pricing.TryGetExaltedPrice(eng, metaId, string.Empty, out unit) && unit > 0;
         }
 
         // Debug: mirror TryGetRecipePrice's branch order and report which path priced the row (and to what),
         // so a mis-resolution (e.g. an uncut gem priced as a different item) is visible in the debug window.
         private (double price, string branch) TraceRecipePrice(in Recipe r)
         {
+            if (this.TryPriceByMetaEnglish(r.MetaId, out var exact))
+                return (exact, $"meta+eng [{r.MetaId}]");
+
             if (IsUncutGem(r.MetaId))
             {
                 int lvl = UncutGemLevel(r.MetaId);
                 if (lvl < 0) return (0, "uncut base/quest (no level)");
                 if (!string.IsNullOrEmpty(r.DdsArt) &&
-                    this.priceCache.TryGetPriceByArtId(r.DdsArt + lvl, out var u) && u > 0)
+                    this.pricing.TryGetPriceByArtId(r.DdsArt + lvl, out var u) && u > 0)
                     return (u, $"uncut dds+lvl [{r.DdsArt}{lvl}]");
-                if (this.TryPriceByMetaEnglish(r.MetaId, out var ue2)) return (ue2, $"uncut meta→eng");
                 return (0, $"uncut MISS lvl={lvl} dds={r.DdsArt}");
             }
 
-            if (!string.IsNullOrEmpty(r.MetaId) && this.priceCache.TryGetPriceByArtId(r.MetaId, out var um) && um > 0)
+            if (!string.IsNullOrEmpty(r.MetaId) && this.pricing.TryGetPriceByArtId(r.MetaId, out var um) && um > 0)
                 return (um, $"metaId [{r.MetaId}]");
 
             int level = LevelFromMetaId(r.MetaId);
             if (level >= 0)
             {
                 if (!string.IsNullOrEmpty(r.DdsArt) &&
-                    this.priceCache.TryGetPriceByArtId(r.DdsArt + level, out var ul) && ul > 0)
+                    this.pricing.TryGetPriceByArtId(r.DdsArt + level, out var ul) && ul > 0)
                     return (ul, $"dds+lvl [{r.DdsArt}{level}]");
             }
-            else if (!string.IsNullOrEmpty(r.DdsArt) && this.priceCache.TryGetPriceByArtId(r.DdsArt, out var ud) && ud > 0)
+            else if (!string.IsNullOrEmpty(r.DdsArt) && this.pricing.TryGetPriceByArtId(r.DdsArt, out var ud) && ud > 0)
             {
                 return (ud, $"dds bare [{r.DdsArt}]");
             }
 
-            if (!string.IsNullOrEmpty(r.MetaId))
-            {
-                this.BuildMetaIdToEnglishIfNeeded();
-                if (this.metaIdToEnglish.TryGetValue(r.MetaId, out var eng) &&
-                    this.priceCache.TryGetExaltedPrice(eng, out var ue) && ue > 0)
-                    return (ue, $"meta→eng [{eng}]");
-            }
 
-            if (this.priceCache.TryGetExaltedPrice(r.Name, out var un) && un > 0)
+            if (this.pricing.TryGetExaltedPrice(r.Name, out var un) && un > 0)
                 return (un, $"name [{r.Name}]");
             return (0, "none");
         }
@@ -1607,10 +1287,6 @@ namespace RunecraftHelper
 
             this.handlePid = 0;
             this.lastGoodGeom.Clear();
-            // The name→keys dict is built from the client's localized BaseItemTypes names, so it's
-            // language-specific. Drop it on process change so it rebuilds (e.g. after a language switch).
-            this.nameToArtId = new Dictionary<string, (string, string)>(StringComparer.Ordinal);
-            this.nameToArtNextTryUtc = DateTime.MinValue;
             this.metaToLocalName = new Dictionary<string, string>(StringComparer.Ordinal);
             this.metaToLocalNextTryUtc = DateTime.MinValue;
         }

@@ -186,9 +186,13 @@ namespace RunecraftHelper
         {
             if (!this.LoadMonolithData()) return;
 
-            // Resolve reward names to the client's language from the in-memory BaseItemTypes table
-            // (once per session). Must run before EnumerateMonoliths so AddCandidate can localize.
-            this.BuildMetaToLocalNameIfNeeded();
+            // Resolve catalog reward names only for windows that display them. The default panel overlay
+            // and locked-row highlight already read live row identity and must never pay this BFS-heavy
+            // remote-memory scan on the render thread.
+            if (RunecraftFrameWorkPolicy.NeedsLocalizedRewardMap(
+                    this.Settings.ShowMonolithRewards,
+                    this.Settings.ShowWindow))
+                this.BuildMetaToLocalNameIfNeeded();
 
             // Seed the default watched glow-runes if the table is empty / missing a default.
             this.EnsureGlowRuneDefaults();
@@ -569,7 +573,7 @@ namespace RunecraftHelper
         }
 
         // Standalone window dumping the live Runeshape Combinations panel rows exactly as the price OVERLAY
-        // resolves them: parsed name → MetaId / DdsArt (from nameToArtId) → which price branch fired → ex.
+        // resolves them: parsed name → live-row MetaId / DdsArt → which price branch fired → ex.
         // Own window (not nested under the monolith debug) so it shows even when no monolith is detected and
         // isn't pushed off-screen by the scrolling candidates table. Driven by the same ShowWindow toggle.
         private void DrawOverlayRowsDebugWindow()
@@ -964,7 +968,7 @@ namespace RunecraftHelper
                             this.metaToLocalName.TryGetValue(rec.reward.id, out var localName))
                     ? localName
                     : rec.reward.name;
-                if (this.priceCache.TryGetExaltedPrice(rec.reward.name, out var u) && u > 0)
+                if (this.pricing.TryGetExaltedPrice(rec.reward.name, out var u) && u > 0)
                 {
                     c.UnitEx = u;
                     c.Priced = true;
@@ -981,8 +985,8 @@ namespace RunecraftHelper
         // Build {BaseItemType.Id → localized Name} once per session so the rewards window can show reward
         // names in the client's language (the catalog json carries only English names). Rooted at the
         // global FileRoot registry (Core.CurrentAreaLoadedFiles.Address) — always available in-game, so it
-        // works without the Combinations panel being open (unlike the price-overlay's nameToArtId, which is
-        // built from a panel BFS root). Throttled while empty so the pointer walk doesn't run every frame.
+        // works without the Combinations panel being open. Throttled while empty so the pointer walk doesn't
+        // run every frame.
         // FileRoot route + row layout: obsidian poe2/Loaders.md.
         private void BuildMetaToLocalNameIfNeeded()
         {

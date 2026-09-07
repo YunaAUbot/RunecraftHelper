@@ -1,8 +1,8 @@
 # RunecraftHelper
 
-A [GH](https://github.com/Gordin/GameHelper2) plugin that draws live [poe.ninja](https://poe.ninja)
-prices, in Exalted Orbs, directly onto the rewards shown in the in-game **Runeshape Combinations**
-panel.
+A [GH](https://github.com/Gordin/GameHelper2) plugin that draws live prices from the host-wide
+**NinjaPricer** provider, in Exalted Orbs, directly onto the rewards shown in the in-game
+**Runeshape Combinations** panel.
 
 While the panel is open, the plugin reads the visible reward rows straight from the game's UI tree
 and paints each row's total value at its right edge — so you can compare combination outcomes at a
@@ -33,7 +33,8 @@ glance without leaving the panel and without a separate window stealing focus.
   - localized name — English clients / unmapped items.
 - **Optional debug window** (`ShowWindow`) listing each visible row's count, resolved metaId, dds-art,
   price and poe.ninja English name — to see at a glance which reward failed to resolve to a price.
-- Pulls currency/item prices from poe.ninja and caches them on disk with a configurable TTL.
+- Reuses NinjaPricer's selected source, league, cache, conversion rates, and refresh lifecycle.
+- Performs no price HTTP requests and owns no independent price cache.
 - Shows per-reward total value in Exalted Orbs (uses the live Divine→Exalted rate).
 
 ## Requirements
@@ -41,55 +42,36 @@ glance without leaving the panel and without a separate window stealing focus.
 - A working [GH](https://github.com/Gordin/GameHelper2) checkout (this is a plugin, not a
   standalone app).
 - .NET 10 SDK (the project targets `net10.0-windows`, x64).
+- The shared GameHelper price contract and an enabled NinjaPricer plugin.
 
 ## Build & install
 
-This plugin is meant to live inside a GH source tree, because it references
-`GameHelper.csproj` and copies its build output into GameHelper's `Plugins` folder.
-
-1. Clone this repo into the GameHelper2 `Plugins` directory so the layout is:
+This private adaptation lives outside the GameHelper2 fork. Supply the host checkout explicitly:
 
    ```
-   <GameHelper2>/
-     GameHelper/
-       GameHelper.csproj
-     Plugins/
-       RunecraftHelper/      ← contents of this repo
-         RunecraftHelper.csproj
-         RunecraftHelperCore.cs
-         ...
+   GAMEHELPER2_HOST_ROOT=/path/to/GameHelper2-LinuxFork \
+     dotnet build RunecraftHelper.csproj -c Release -p:EnableWindowsTargeting=true
    ```
 
-   The `.csproj` expects `..\..\GameHelper\GameHelper.csproj` to exist relative to itself.
-
-2. Build:
-
-   ```
-   dotnet build Plugins/RunecraftHelper/RunecraftHelper.csproj -c Debug
-   ```
-
-   The post-build step copies `RunecraftHelper.dll` into
-   `GameHelper/<OutDir>/Plugins/RunecraftHelper/`.
-
-3. Launch GameHelper2 and enable **RunecraftHelper** in the plugin list.
+Publish the DLL/PDB plus bundled JSON, icons, and localization into the private repository's
+`dist/RunecraftHelper/`; the GameHelper runtime links directly to that directory.
 
 ## Settings
 
 | Setting | Default | Notes |
 |---|---|---|
-| **League** | `Runes of Aldur` | poe.ninja PoE2 league slug; update each league launch. |
-| **Refresh interval (min)** | `60` | How long cached prices stay valid before a re-fetch (5–60). |
 | **Color mode** | `Relative` | Price-text tint: `Off` / `Relative` (vs. on-screen median) / `Absolute` (fixed Exalted thresholds). |
 | **Price X offset** | `0` | Horizontal nudge (px) of the price text; clears long names / letterbox bars (−400…+400). |
 | **Show debug list window** | `on` | Per-row table: count · metaId · dds-art · price · poe.ninja name. |
 
-The settings panel also shows the price-cache status (last sync, items cached, Divine→Exalted rate)
-and a **Refresh now** button.
+The settings panel shows NinjaPricer's provider/source, league, refresh state, item count, and last
+update time. **Refresh now** delegates to NinjaPricer.
 
 ## Credits
 
 - Built as a plugin for [GameHelper2](https://github.com/Gordin/GameHelper2).
-- Prices courtesy of [poe.ninja](https://poe.ninja).
+- Upstream source and exact imported commit: see `UPSTREAM.md`.
+- Price data is supplied by the separately installed NinjaPricer provider.
 
 ## Disclaimer
 
