@@ -26,7 +26,7 @@ Supply GameHelper2 via `GAMEHELPER2_HOST_ROOT` or `-p:GameHelperHostRoot=...`. N
 
 ```bash
 export GAMEHELPER2_HOST_ROOT=/path/to/GameHelper2
-dotnet test RunecraftHelper.Tests/RunecraftHelper.Tests.csproj -c Release
+dotnet test test/RunecraftHelper.Tests.csproj -c Release
 dotnet build RunecraftHelper.csproj -c Release -p:EnableWindowsTargeting=true
 git diff --check
 ```
@@ -36,3 +36,12 @@ A real Runestone-panel test remains the final acceptance gate for render-perform
 ## Safety
 
 Read-only process-memory access only. No game input, process control, process writes, injection, packet manipulation, or independent price networking.
+
+## Git importer layout
+
+Keep the production project and source at repository root. Every auxiliary project
+and tool belongs under `test/` (tools under `test/tools/`). Preserve assembly identity
+and exclude test/tools and nested obj/bin from all production SDK items.
+Run `python3 test/check_import_layout.py` with `GAMEHELPER2_HOST_ROOT` and `DOTNET` set.
+See [ROOT_LAYOUT.md](ROOT_LAYOUT.md) for the pinned importer contract and verification
+commands that use existing host artifacts without rebuilding or modifying the host.

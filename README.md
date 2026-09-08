@@ -76,3 +76,10 @@ update time. **Refresh now** delegates to NinjaPricer.
 ## Disclaimer
 
 This is a read-only overlay tool for personal use. Use at your own risk and in accordance with the game's terms of service.
+
+## Repository layout verification
+
+Production source and the plugin project live at repository root; tests and any
+auxiliary tools belong under `test/`. See [ROOT_LAYOUT.md](ROOT_LAYOUT.md) for the
+verified Git importer contract, test commands, and builds against an already-built
+GameHelper2 host without modifying it.
