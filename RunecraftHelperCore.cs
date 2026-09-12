@@ -157,7 +157,12 @@ namespace RunecraftHelper
             this.pricing = ProviderPricingPass.Capture(() => PriceProviderRegistry.Current);
         }
 
-        public override void OnDisable() => this.ResetHandle();
+        public override void OnDisable()
+        {
+            this.CancelRouteCompute();
+            this.ResetMonolithScan();
+            this.ResetHandle();
+        }
 
         public override void SaveSettings()
         {
@@ -361,6 +366,8 @@ namespace RunecraftHelper
             if (Core.States.GameCurrentState != GameStateTypes.InGameState)
             {
                 this.recipes.Clear();
+                this.CancelRouteCompute();
+                this.ResetMonolithScan();
                 return;
             }
 

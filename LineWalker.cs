@@ -1,18 +1,23 @@
-#nullable enable
 namespace RunecraftHelper
 {
     using System;
     using System.Collections.Generic;
     using System.Numerics;
-    using GameHelper.RemoteObjects.Components;
-    using GameHelper.RemoteObjects.States.InGameStateObjects;
+    using System.Threading;
 
-    // Grid-space line walkability checker. Copied verbatim from SekhemaHelper/Radar (plugins can't
-    // reference each other's assemblies) so the Expedition planner follows walkable terrain the same way.
-    // Bresenham sampling over the nibble-encoded walkability grid.
-    public static class LineWalker
+    /// <summary>
+    /// Grid-space line walkability checker.
+    /// Uses Bresenham's line algorithm to sample grid cells along a straight line
+    /// and checks each against the nibble-encoded walkability data.
+    /// </summary>
+    public static partial class LineWalker
     {
-        // 4-bit nibble per cell in the packed walkability byte array. 0 = blocked, 1-5 = walkable.
+        /// <summary>
+        /// Checks whether a single grid cell is walkable.
+        /// Decodes the 4-bit nibble from the packed walkability byte array.
+        /// 0 = blocked, 1-5 = walkable.
+        /// Optionally consults a door-override set (positions forced walkable).
+        /// </summary>
         public static bool IsWalkable(
             byte[] walkableData,
             int bytesPerRow,
@@ -20,6 +25,12 @@ namespace RunecraftHelper
             int y,
             HashSet<(int, int)>? doorOverrides = null)
         {
+            if (bytesPerRow <= 0 || x < 0 || (long)x >= (long)bytesPerRow * 2 ||
+                y < 0 || y >= walkableData.Length / bytesPerRow)
+            {
+                return false;
+            }
+
             if (doorOverrides != null && doorOverrides.Contains((x, y)))
             {
                 return true;
@@ -37,13 +48,31 @@ namespace RunecraftHelper
             return value != 0;
         }
 
+        /// <summary>
+        /// Result of a line walkability check.
+        /// </summary>
         public struct LineResult
         {
+            /// <summary>
+            /// True if every cell along the line is walkable.
+            /// </summary>
             public bool IsClear;
+
+            /// <summary>
+            /// Number of blocked (non-walkable) cells encountered.
+            /// </summary>
             public int BlockedCells;
+
+            /// <summary>
+            /// Total number of cells sampled along the line.
+            /// </summary>
             public int TotalCells;
         }
 
+        /// <summary>
+        /// Walks a Bresenham line from start to end (Vector2 variant),
+        /// checking each grid cell for walkability.
+        /// </summary>
         public static LineResult CheckLine(
             byte[] walkableData,
             int bytesPerRow,
@@ -61,6 +90,10 @@ namespace RunecraftHelper
                 doorOverrides);
         }
 
+        /// <summary>
+        /// Walks a Bresenham line from (x0,y0) to (x1,y1),
+        /// checking each grid cell for walkability.
+        /// </summary>
         public static LineResult CheckLine(
             byte[] walkableData,
             int bytesPerRow,
@@ -69,6 +102,37 @@ namespace RunecraftHelper
             int x1,
             int y1,
             HashSet<(int, int)>? doorOverrides = null)
+        {
+            return CheckLineCore(walkableData, bytesPerRow, x0, y0, x1, y1, doorOverrides, false);
+        }
+
+        /// <summary>
+        /// Tests visibility without counting blocked cells; stops at the first obstacle.
+        /// </summary>
+        public static bool IsLineClear(
+            byte[] walkableData,
+            int bytesPerRow,
+            Vector2 start,
+            Vector2 end,
+            HashSet<(int, int)>? doorOverrides = null,
+            CancellationToken cancellationToken = default)
+        {
+            return CheckLineCore(
+                walkableData, bytesPerRow,
+                (int)Math.Round(start.X), (int)Math.Round(start.Y),
+                (int)Math.Round(end.X), (int)Math.Round(end.Y),
+                doorOverrides, true, cancellationToken).IsClear;
+        }
+
+        private static LineResult CheckLineCore(
+            byte[] walkableData,
+            int bytesPerRow,
+            int x0,
+            int y0,
+            int x1,
+            int y1,
+            HashSet<(int, int)>? doorOverrides,
+            bool stopAtFirstBlocked, CancellationToken cancellationToken = default)
         {
             var result = new LineResult { IsClear = true };
 
@@ -83,12 +147,17 @@ namespace RunecraftHelper
 
             while (true)
             {
+                if ((result.TotalCells & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
                 result.TotalCells++;
 
                 if (!IsWalkable(walkableData, bytesPerRow, x, y, doorOverrides))
                 {
                     result.IsClear = false;
                     result.BlockedCells++;
+                    if (stopAtFirstBlocked)
+                    {
+                        return result;
+                    }
                 }
 
                 if (x == x1 && y == y1)
@@ -113,55 +182,5 @@ namespace RunecraftHelper
             return result;
         }
 
-        // Doors punch through wall-type terrain cells; mark a 5x5 area around each door entity as
-        // forced-walkable so A* can route through opened doorways (same as Radar/SekhemaHelper).
-        public static HashSet<(int, int)>? BuildDoorOverrideMap(AreaInstance areaInstance)
-        {
-            HashSet<(int, int)>? overrides = null;
-            const int doorRadius = 2; // 5x5 area
-
-            void MarkArea(int gx, int gy)
-            {
-                overrides ??= new HashSet<(int, int)>();
-                for (var dx = -doorRadius; dx <= doorRadius; dx++)
-                {
-                    for (var dy = -doorRadius; dy <= doorRadius; dy++)
-                    {
-                        overrides.Add((gx + dx, gy + dy));
-                    }
-                }
-            }
-
-            foreach (var kv in areaInstance.AwakeEntities)
-            {
-                var entity = kv.Value;
-
-                if (entity.TryGetComponent<TriggerableBlockage>(out var _))
-                {
-                    if (entity.TryGetComponent<Render>(out var render))
-                    {
-                        MarkArea(
-                            (int)Math.Round(render.GridPosition.X),
-                            (int)Math.Round(render.GridPosition.Y));
-                    }
-
-                    continue;
-                }
-
-                var path = entity.Path;
-                if (!string.IsNullOrEmpty(path) &&
-                    path.Contains("Door", StringComparison.OrdinalIgnoreCase))
-                {
-                    if (entity.TryGetComponent<Render>(out var render))
-                    {
-                        MarkArea(
-                            (int)Math.Round(render.GridPosition.X),
-                            (int)Math.Round(render.GridPosition.Y));
-                    }
-                }
-            }
-
-            return overrides;
-        }
     }
 }

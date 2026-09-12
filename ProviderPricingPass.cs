@@ -1,11 +1,13 @@
 namespace RunecraftHelper;
 
 using System;
+using System.Collections.Generic;
 using GameHelper.Plugin.Price;
 
 internal sealed class ProviderPricingPass
 {
     private readonly IPriceProvider? provider;
+    private readonly Dictionary<(string, string, string), (bool Found, double Value)> prices = new();
 
     private ProviderPricingPass(IPriceProvider? provider) => this.provider = provider;
 
@@ -35,6 +37,20 @@ internal sealed class ProviderPricingPass
         string itemName,
         string internalPathBasename,
         string fullItemPath,
+        out double exaltedPrice)
+    {
+        var key = (itemName, internalPathBasename, fullItemPath);
+        if (!this.prices.TryGetValue(key, out var cached))
+        {
+            var found = this.LookupExaltedPrice(itemName, internalPathBasename, fullItemPath, out var value);
+            cached = (found, value);
+            this.prices[key] = cached;
+        }
+        exaltedPrice = cached.Value;
+        return cached.Found;
+    }
+
+    private bool LookupExaltedPrice(string itemName, string internalPathBasename, string fullItemPath,
         out double exaltedPrice)
     {
         exaltedPrice = 0;

@@ -16,4 +16,8 @@
     <Compile Include="../RunecraftHelperSettings.cs" Link="Production/RunecraftHelperSettings.cs" />
     <Compile Include="../RunecraftFrameWorkPolicy.cs" Link="Production/RunecraftFrameWorkPolicy.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../LineWalker.cs" Link="Production/LineWalker.cs" />
+    <Compile Include="../WalkablePathfinder.cs" Link="Production/WalkablePathfinder.cs" />
+  </ItemGroup>
 </Project>

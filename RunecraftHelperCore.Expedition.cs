@@ -428,13 +428,33 @@ namespace RunecraftHelper
         // (door-set, start, end) query recurs dozens of times (diagnostics, greedy, pursuit, refine, smooth,
         // gate-lookahead) and the worst ones flood the whole reachable component before returning -1. Door sets are
         // immutable after creation (gate-opening COPIES — see ExpOpenGatesHitBy), so each configuration is keyed by
-        // reference identity; (start,end) complete the key. [ThreadStatic] is safe + correct because one compute
-        // runs synchronously on a single Task thread (set in ExpComputeRoute, cleared in its finally).
+        // reference identity; (start,end) complete the key. Serial helpers use the task-thread scope;
+        // parallel tour rows receive the same cache explicitly (ThreadStatic does not flow to workers).
         [ThreadStatic]
         private static ExpPathCache? expCache;
+        private CancellationTokenSource routeCancellation = new();
+        private int routeGeneration;
+        private Task? routeTask;
+
+        private void CancelRouteCompute()
+        {
+            if (this.routeTask == null && !this.expComputing && this.expPendingResult == null) return;
+            this.routeGeneration++;
+            var previous = this.routeCancellation;
+            previous.Cancel();
+            if (this.routeTask is { } task)
+                _ = task.ContinueWith(t => { _ = t.Exception; previous.Dispose(); }, TaskScheduler.Default);
+            else previous.Dispose();
+            this.routeTask = null;
+            this.routeCancellation = new();
+            lock (this.expResultLock) this.expPendingResult = null;
+            this.expComputing = false;
+        }
 
         private sealed class ExpPathCache
         {
+            public CancellationToken Token;
+            private readonly object componentLock = new();
             // All collections are concurrent: the greedy step evaluates its candidates in parallel (Parallel.For),
             // so the path helpers hit this cache from several threads at once. ConcurrentDictionary reads/writes are
             // lock-free; a rare double-compute of the same key just stores the same value twice (harmless).
@@ -482,7 +502,11 @@ namespace RunecraftHelper
             // grid is absent / too big — caller then just runs A*.
             public int[]? Components(byte[] data, int bpr, HashSet<(int, int)>? doors, int doorId)
             {
+                lock (this.componentLock)
+                {
+                this.Token.ThrowIfCancellationRequested();
                 if (this.components.TryGetValue(doorId, out var cached)) return cached;
+                if (this.components.Count >= 8) return null; // Bound per-plan terrain copies.
 
                 int w = bpr * 2, h = bpr > 0 ? data.Length / bpr : 0;
                 int[]? labels = null;
@@ -494,6 +518,7 @@ namespace RunecraftHelper
                     int next = 0;
                     for (int sy = 0; sy < h; sy++)
                     {
+                        this.Token.ThrowIfCancellationRequested();
                         for (int sx = 0; sx < w; sx++)
                         {
                             int si = (sy * w) + sx;
@@ -503,8 +528,10 @@ namespace RunecraftHelper
                             int id = next++;
                             labels[si] = id;
                             stack.Push(si);
+                            var floodWork = 0;
                             while (stack.Count > 0)
                             {
+                                if ((floodWork++ & 255) == 0) this.Token.ThrowIfCancellationRequested();
                                 int ci = stack.Pop();
                                 int cx = ci % w, cy = ci / w;
                                 for (int dy = -1; dy <= 1; dy++)
@@ -528,6 +555,7 @@ namespace RunecraftHelper
 
                 this.components[doorId] = labels;
                 return labels;
+                }
             }
         }
 
@@ -701,8 +729,7 @@ namespace RunecraftHelper
 
                 // Drop any in-flight / pending background plan from the previous area (a late result would be
                 // stale; the fingerprint would flag it anyway, but clear so the button doesn't stick on "Cooking").
-                lock (this.expResultLock) { this.expPendingResult = null; }
-                this.expComputing = false;
+                this.CancelRouteCompute();
 
                 // Map modifiers are per-map and auto-detected from the AreaInstance each scan
                 // (ApplyExpeditionMapMods), so nothing to carry over or reset here.
@@ -917,7 +944,7 @@ namespace RunecraftHelper
                 if (haveFrom)
                 {
                     straight = Vector2.Distance(prev, c.Pos);
-                    if (canWalk)
+                    if (canWalk && (this.Settings.ShowExpeditionDebug || this.Settings.ShowExpeditionGridValue))
                     {
                         path = ExpPathLength(data, bpr, doors, prev, c.Pos);
                         cost = ExpPathCost(data, bpr, doors, prev, c.Pos);
@@ -1046,11 +1073,12 @@ namespace RunecraftHelper
         }
 
         // Walkable A* path length (grid units, smoothed geometric) between two grid points; -1 if no path.
-        private static float ExpPathLength(byte[]? data, int bytesPerRow, HashSet<(int, int)>? doors, Vector2 a, Vector2 b)
+        private static float ExpPathLength(byte[]? data, int bytesPerRow, HashSet<(int, int)>? doors, Vector2 a, Vector2 b, ExpPathCache? explicitCache = null)
         {
             if (data == null) return -1f;
 
-            var cache = expCache;
+            var cache = explicitCache ?? expCache;
+            cache?.Token.ThrowIfCancellationRequested();
             (int, int, int, int, int) key = default;
             if (cache != null)
             {
@@ -1077,7 +1105,7 @@ namespace RunecraftHelper
             }
 
             long t0 = Stopwatch.GetTimestamp();
-            var route = WalkablePathfinder.FindPath(data, bytesPerRow, a, b, doors);
+            var route = WalkablePathfinder.FindPath(data, bytesPerRow, a, b, doors, cancellationToken: cache?.Token ?? default);
             float len = 0f;
             if (route == null || route.Count < 2)
             {
@@ -1174,12 +1202,7 @@ namespace RunecraftHelper
         private void EnsureExpeditionMonoliths()
         {
             if (!this.LoadMonolithData()) return;
-            var now = DateTime.UtcNow;
-            if (now >= this.nextMonolithScanUtc)
-            {
-                this.monolithViews = this.EnumerateMonoliths();
-                this.nextMonolithScanUtc = now.AddMilliseconds(750);
-            }
+            this.RefreshMonoliths();
         }
 
         // GameUi → [97][9][17][1] → ExplosiveCounter HUD widget. Present (and IsVisible) only while the
@@ -1576,7 +1599,7 @@ namespace RunecraftHelper
             }
 
             long t0 = Stopwatch.GetTimestamp();
-            var route = WalkablePathfinder.FindPath(data, bpr, a, b, doors, maxCost: maxDist * 1.5f);
+            var route = WalkablePathfinder.FindPath(data, bpr, a, b, doors, maxCost: maxDist * 1.5f, cancellationToken: cache?.Token ?? default);
             float result;
             if (route == null || route.Count < 2)
             {
@@ -1595,9 +1618,9 @@ namespace RunecraftHelper
 
         // Full walkable A* path length a→b (no cap); -1 if no path. Falls back to straight line when there's no
         // walkable grid. Used by the route planner to score pursuit of far targets (prize-per-path) and tour cost.
-        private static float ExpFullPath(byte[]? data, int bpr, HashSet<(int, int)>? doors, Vector2 a, Vector2 b)
+        private static float ExpFullPath(byte[]? data, int bpr, HashSet<(int, int)>? doors, Vector2 a, Vector2 b, ExpPathCache? cache = null)
         {
-            if (data != null) return ExpPathLength(data, bpr, doors, a, b);
+            if (data != null) return ExpPathLength(data, bpr, doors, a, b, cache);
             return Vector2.Distance(a, b);
         }
 
@@ -1657,11 +1680,11 @@ namespace RunecraftHelper
                 var key = (cache.DoorId(pathDoors), (int)Math.Round(from.X), (int)Math.Round(from.Y),
                            (int)Math.Round(toward.X), (int)Math.Round(toward.Y));
                 if (cache.Path.TryGetValue(key, out route)) { cache.Hit(); }
-                else { long t0 = Stopwatch.GetTimestamp(); route = WalkablePathfinder.FindPath(data, bpr, from, toward, pathDoors); cache.Miss(); cache.AddAStarTicks(Stopwatch.GetTimestamp() - t0); cache.Path[key] = route; }
+                else { long t0 = Stopwatch.GetTimestamp(); route = WalkablePathfinder.FindPath(data, bpr, from, toward, pathDoors, cancellationToken: cache.Token); cache.Miss(); cache.AddAStarTicks(Stopwatch.GetTimestamp() - t0); cache.Path[key] = route; }
             }
             else
             {
-                route = WalkablePathfinder.FindPath(data, bpr, from, toward, pathDoors);
+                route = WalkablePathfinder.FindPath(data, bpr, from, toward, pathDoors, cancellationToken: cache?.Token ?? default);
             }
 
             if (route == null || route.Count < 2) return false;
@@ -1924,13 +1947,17 @@ namespace RunecraftHelper
             if (this.expComputing) return;
             var inp = this.BuildRouteInputs();
             this.expComputing = true;
-            Task.Run(() =>
+            var generation = this.routeGeneration;
+            var token = this.routeCancellation.Token;
+            this.routeTask = Task.Run(() =>
             {
                 ExpRouteResult res;
-                try { res = ExpComputeRoute(inp); }
+                try { res = ExpComputeRoute(inp, token); }
+                catch (OperationCanceledException) { return; }
                 catch { res = new ExpRouteResult(); }   // a bg-thread throw must never take the plugin down
                 lock (this.expResultLock)
                 {
+                    if (generation != this.routeGeneration || token.IsCancellationRequested) return;
                     this.expPendingResult = res;
                     this.expPendingFingerprint = fingerprint;
                 }
@@ -1994,9 +2021,9 @@ namespace RunecraftHelper
         private static bool ExpIsGrand(int totalCharges) => totalCharges >= ExpGrandChargeThreshold;
 
         // Route planner: the monolith SPINE + PLACER pipeline (ComputeRouteSpine) — the only strategy.
-        private static ExpRouteResult ExpComputeRoute(ExpRouteInputs inp)
+        private static ExpRouteResult ExpComputeRoute(ExpRouteInputs inp, CancellationToken token = default)
         {
-            var cache = new ExpPathCache();
+            var cache = new ExpPathCache { Token = token };
             expCache = cache;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             try
@@ -2050,7 +2077,7 @@ namespace RunecraftHelper
                 for (int i = 0; i < inp.TPos.Count; i++)
                     if (inp.TPos[i] == to) { toZ = inp.TWorld[i].Z; break; }
 
-                var seg = data != null ? WalkablePathfinder.FindPath(data, bpr, from, to, doors) : null;
+                var seg = data != null ? WalkablePathfinder.FindPath(data, bpr, from, to, doors, cancellationToken: expCache?.Token ?? default) : null;
                 var wp = (seg != null && seg.Count >= 2) ? seg : new List<Vector2> { from, to };
 
                 // Total segment length up front, so Z can interpolate by arc fraction across the whole hop.
@@ -2668,9 +2695,10 @@ namespace RunecraftHelper
             int m = stops.Count;
             if (m <= 2) return new List<Vector2>(stops);
 
+            var sharedCache = expCache;
             float Dist(Vector2 a, Vector2 b)
             {
-                float d = ExpFullPath(data, bpr, doors, a, b);
+                float d = ExpFullPath(data, bpr, doors, a, b, sharedCache);
                 return d < 0f ? Vector2.Distance(a, b) * 4f : d;   // no path → discourage but keep finite
             }
 
@@ -2681,7 +2709,7 @@ namespace RunecraftHelper
             // j>i, and each off-diagonal cell is owned by exactly one row.
             var dmat = new float[m, m];
             var ddet = new float[m];
-            Parallel.For(0, m, i =>
+            Parallel.For(0, m, new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = sharedCache?.Token ?? default }, i =>
             {
                 ddet[i] = Dist(inp.DetonatorPos, stops[i]);
                 for (int j = i + 1; j < m; j++) { float d = Dist(stops[i], stops[j]); dmat[i, j] = d; dmat[j, i] = d; }

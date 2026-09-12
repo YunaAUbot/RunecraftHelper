@@ -133,6 +133,13 @@ namespace RunecraftHelper
         }
 
         private List<MonoRecipe> monolithRecipes = new();
+        private readonly Dictionary<(int Rune, int Position), List<MonoRecipe>> recipesByAnchor = new();
+        private readonly Dictionary<(int Rune, int Position, int Holes, int Level, bool Unique), List<MonoRecipe>> candidateRecipes = new();
+        private IEnumerator<MonoView?>? monolithScan;
+        private List<MonoView> pendingMonolithViews = new();
+        private string monolithArea = string.Empty;
+        private IntPtr monolithAreaAddress;
+        private long lastMonolithPump;
         private readonly List<double> monoPriceScratch = new(); // per-reward totals → row-total colour median
         private Dictionary<int, string> runeNames = new();
         // (anchorRune, pos1based, size) → min area level at which that partial size is offered.
@@ -156,6 +163,19 @@ namespace RunecraftHelper
                 var file = JsonConvert.DeserializeObject<MonoFile>(File.ReadAllText(path));
                 if (file?.recipes == null) return false;
                 this.monolithRecipes = file.recipes;
+                this.recipesByAnchor.Clear();
+                this.candidateRecipes.Clear();
+                foreach (var recipe in this.monolithRecipes)
+                {
+                    if (recipe.runeIdx == null) continue;
+                    for (var position = 0; position < recipe.runeIdx.Count; position++)
+                    {
+                        var key = (recipe.runeIdx[position], position);
+                        if (!this.recipesByAnchor.TryGetValue(key, out var matches))
+                            this.recipesByAnchor[key] = matches = new();
+                        matches.Add(recipe);
+                    }
+                }
                 this.runeNames = new Dictionary<int, string>();
                 if (file.runes != null)
                     foreach (var kv in file.runes)
@@ -197,12 +217,7 @@ namespace RunecraftHelper
             // Seed the default watched glow-runes if the table is empty / missing a default.
             this.EnsureGlowRuneDefaults();
 
-            var now = DateTime.UtcNow;
-            if (now >= this.nextMonolithScanUtc)
-            {
-                this.monolithViews = this.EnumerateMonoliths();
-                this.nextMonolithScanUtc = now.AddMilliseconds(750);
-            }
+            this.RefreshMonoliths();
 
             // Map value labels: optionally suppressed while the Runeshape Combinations panel is open so
             // they don't clutter the map on top of the panel's own per-recipe overlay.
@@ -648,11 +663,57 @@ namespace RunecraftHelper
         }
 
         // ── enumeration / resolution ──────────────────────────────────────────
-        private List<MonoView> EnumerateMonoliths()
+        private void ResetMonolithScan()
         {
-            var list = new List<MonoView>();
+            if (this.monolithScan == null && this.monolithViews.Count == 0 && this.pendingMonolithViews.Count == 0) return;
+            this.monolithScan?.Dispose();
+            this.monolithScan = null;
+            this.pendingMonolithViews = new();
+            this.monolithViews = new();
+            this.nextMonolithScanUtc = DateTime.MinValue;
+            this.lastMonolithPump = 0;
+        }
+
+        private void RefreshMonoliths()
+        {
             var area = Core.States.InGameStateObject.CurrentAreaInstance;
-            if (area == null) return list;
+            if (area.AreaHash != this.monolithArea || area.Address != this.monolithAreaAddress)
+            {
+                this.ResetMonolithScan();
+                this.candidateRecipes.Clear();
+                this.monolithArea = area.AreaHash;
+                this.monolithAreaAddress = area.Address;
+            }
+            var now = Environment.TickCount64;
+            if (now - this.lastMonolithPump < 8) return; // Shared by rewards and expedition callers.
+            this.lastMonolithPump = now;
+            if (this.monolithScan == null)
+            {
+                if (DateTime.UtcNow < this.nextMonolithScanUtc) return;
+                this.monolithScan = this.EnumerateMonoliths().GetEnumerator();
+                this.pendingMonolithViews = new();
+            }
+            using var profile = GameHelper.Ui.PerformanceProfiler.Profile("RunecraftHelper", "MonolithScanSlice");
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            for (var count = 0; count < 128 && timer.ElapsedMilliseconds < 2; count++)
+            {
+                if (!this.monolithScan.MoveNext())
+                {
+                    this.monolithScan.Dispose();
+                    this.monolithScan = null;
+                    this.pendingMonolithViews.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+                    this.monolithViews = this.pendingMonolithViews;
+                    this.nextMonolithScanUtc = DateTime.UtcNow.AddMilliseconds(750);
+                    break;
+                }
+                if (this.monolithScan.Current is { } view) this.pendingMonolithViews.Add(view);
+            }
+        }
+
+        private IEnumerable<MonoView?> EnumerateMonoliths()
+        {
+            var area = Core.States.InGameStateObject.CurrentAreaInstance;
+            if (area == null) yield break;
             int areaLevel = area.CurrentAreaLevel;
 
             Vector2 pg = default;
@@ -665,6 +726,7 @@ namespace RunecraftHelper
 
             foreach (var kv in area.AwakeEntities)
             {
+                yield return null; // Permit a frame boundary even for long runs of irrelevant entities.
                 var e = kv.Value;
                 // Validity gate: IsValid catches devices removed from the area; EntityState weeds out
                 // unresolved/dead. NOTE: collecting a monolith does NOT clear these (the device persists
@@ -810,11 +872,10 @@ namespace RunecraftHelper
                 // Kept in the list for the debug dump; the route excludes it by EntityId (see ExpComputeRoute).
                 if (v.RecipeMode == 0) v.IsForeign = true;
 
-                list.Add(v);
+                yield return v;
             }
 
-            list.Sort((a, b) => a.Distance.CompareTo(b.Distance));
-            return list;
+
         }
 
         // Walk the device StateMachine's listener vector to the RuneStation that registered on it.
@@ -899,7 +960,12 @@ namespace RunecraftHelper
         private void BuildCandidates(MonoView v, int areaLevel)
         {
             if (v.AnchorIdx < 0 || v.AnchorPos < 0 || v.HoleCount <= 0) return;
-            foreach (var rec in this.monolithRecipes)
+            var key = (v.AnchorIdx, v.AnchorPos, v.HoleCount, areaLevel, false);
+            if (!this.candidateRecipes.TryGetValue(key, out var matches))
+            {
+                matches = new();
+                if (!this.recipesByAnchor.TryGetValue((v.AnchorIdx, v.AnchorPos), out var indexed)) indexed = new();
+            foreach (var rec in indexed)
             {
                 if (rec.runeIdx == null || rec.runeIdx.Count <= v.AnchorPos) continue;
                 if (rec.size > v.HoleCount) continue;
@@ -914,9 +980,12 @@ namespace RunecraftHelper
                 if (rec.size != v.HoleCount &&
                     !this.IsPartialAllowed(v.AnchorIdx, v.AnchorPos, rec.size, areaLevel)) continue;
 
-                this.AddCandidate(v, rec);
+                matches.Add(rec);
             }
 
+                this.candidateRecipes[key] = matches;
+            }
+            foreach (var rec in matches) this.AddCandidate(v, rec);
             v.Candidates.Sort((a, b) => (b.UnitEx * b.Count).CompareTo(a.UnitEx * a.Count));
         }
 
@@ -929,14 +998,20 @@ namespace RunecraftHelper
         private void BuildCandidatesUnique(MonoView v, int areaLevel)
         {
             if (v.HoleCount <= 0) return;
-            foreach (var rec in this.monolithRecipes)
+            var key = (-1, -1, v.HoleCount, areaLevel, true);
+            if (!this.candidateRecipes.TryGetValue(key, out var matches))
             {
-                if (rec.size > v.HoleCount) continue;
-                if (areaLevel > 0 && rec.maxLevel > 0 &&
-                    (areaLevel < rec.minLevel || areaLevel > rec.maxLevel)) continue;
-                this.AddCandidate(v, rec);
+                matches = new();
+                foreach (var rec in this.monolithRecipes)
+                {
+                    if (rec.size > v.HoleCount) continue;
+                    if (areaLevel > 0 && rec.maxLevel > 0 &&
+                        (areaLevel < rec.minLevel || areaLevel > rec.maxLevel)) continue;
+                    matches.Add(rec);
+                }
+                this.candidateRecipes[key] = matches;
             }
-
+            foreach (var rec in matches) this.AddCandidate(v, rec);
             v.Candidates.Sort((a, b) => (b.UnitEx * b.Count).CompareTo(a.UnitEx * a.Count));
         }
 

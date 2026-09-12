@@ -4,6 +4,7 @@ namespace RunecraftHelper
     using System;
     using System.Collections.Generic;
     using System.Numerics;
+    using System.Threading;
 
     // A* over the nibble-encoded walkability grid. Copied from SekhemaHelper/Radar (plugins can't
     // reference each other) so the Expedition planner measures/draws real walkable paths instead of
@@ -36,7 +37,7 @@ namespace RunecraftHelper
             Vector2 end,
             HashSet<(int, int)>? doorOverrides = null,
             int maxIterations = DefaultMaxIterations,
-            float maxCost = float.MaxValue)
+            float maxCost = float.MaxValue, CancellationToken cancellationToken = default)
         {
             return FindPath(
                 walkableData,
@@ -47,7 +48,7 @@ namespace RunecraftHelper
                 (int)Math.Round(end.Y),
                 doorOverrides,
                 maxIterations,
-                maxCost);
+                maxCost, cancellationToken);
         }
 
         // maxCost bounds the search by f-score (g + admissible Euclidean h): the moment the cheapest open node's
@@ -65,8 +66,9 @@ namespace RunecraftHelper
             int endY,
             HashSet<(int, int)>? doorOverrides = null,
             int maxIterations = DefaultMaxIterations,
-            float maxCost = float.MaxValue)
+            float maxCost = float.MaxValue, CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!LineWalker.IsWalkable(walkableData, bytesPerRow, startX, startY, doorOverrides))
             {
                 if (!TryFindNearestWalkable(
@@ -102,7 +104,7 @@ namespace RunecraftHelper
             var startKey = (startX, startY);
             var goalKey = (endX, endY);
 
-            var openSet = new PriorityQueue<(int x, int y), float>();
+            var openSet = new PriorityQueue<((int x, int y) node, float g), float>();
             var cameFrom = new Dictionary<(int x, int y), (int x, int y)>();
             var gScore = new Dictionary<(int x, int y), float>();
 
@@ -114,18 +116,21 @@ namespace RunecraftHelper
             }
 
             gScore[startKey] = 0f;
-            openSet.Enqueue(startKey, Heuristic(startX, startY));
+            openSet.Enqueue((startKey, 0f), Heuristic(startX, startY));
 
             var iterations = 0;
 
             while (openSet.Count > 0 && iterations < maxIterations)
             {
-                iterations++;
-                if (!openSet.TryDequeue(out var current, out var currentF))
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!openSet.TryDequeue(out var entry, out var currentF))
                 {
                     break;
                 }
 
+                var current = entry.node;
+                if (entry.g != gScore[current]) continue;
+                iterations++;
                 if (currentF > maxCost)
                 {
                     return null;   // cheapest remaining node already exceeds the budget → no path within maxCost
@@ -134,7 +139,7 @@ namespace RunecraftHelper
                 if (current == goalKey)
                 {
                     var rawPath = ReconstructPath(cameFrom, current, startKey);
-                    return SmoothPath(walkableData, bytesPerRow, rawPath, doorOverrides);
+                    return SmoothPath(walkableData, bytesPerRow, rawPath, doorOverrides, cancellationToken);
                 }
 
                 var currentG = gScore[current];
@@ -167,7 +172,7 @@ namespace RunecraftHelper
                         cameFrom[neighborKey] = current;
                         gScore[neighborKey] = tentativeG;
                         var fScore = tentativeG + Heuristic(nx, ny);
-                        openSet.Enqueue(neighborKey, fScore);
+                        openSet.Enqueue((neighborKey, tentativeG), fScore);
                     }
                 }
             }
@@ -185,8 +190,9 @@ namespace RunecraftHelper
             Vector2 start,
             Vector2 end,
             HashSet<(int, int)>? doorOverrides = null,
-            int maxIterations = DefaultMaxIterations)
+            int maxIterations = DefaultMaxIterations, CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             int startX = (int)Math.Round(start.X), startY = (int)Math.Round(start.Y);
             int endX = (int)Math.Round(end.X), endY = (int)Math.Round(end.Y);
 
@@ -200,7 +206,7 @@ namespace RunecraftHelper
 
             var startKey = (startX, startY);
             var goalKey = (endX, endY);
-            var openSet = new PriorityQueue<(int x, int y), float>();
+            var openSet = new PriorityQueue<((int x, int y) node, float g), float>();
             var gScore = new Dictionary<(int x, int y), float>();
 
             float Heuristic(int x, int y)
@@ -211,13 +217,16 @@ namespace RunecraftHelper
             }
 
             gScore[startKey] = 0f;
-            openSet.Enqueue(startKey, Heuristic(startX, startY));
+            openSet.Enqueue((startKey, 0f), Heuristic(startX, startY));
 
             var iterations = 0;
             while (openSet.Count > 0 && iterations < maxIterations)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                var entry = openSet.Dequeue();
+                var current = entry.node;
+                if (entry.g != gScore[current]) continue;
                 iterations++;
-                var current = openSet.Dequeue();
                 if (current == goalKey) return gScore[current];
 
                 var currentG = gScore[current];
@@ -238,7 +247,7 @@ namespace RunecraftHelper
                     if (!gScore.TryGetValue(neighborKey, out var existingG) || tentativeG < existingG)
                     {
                         gScore[neighborKey] = tentativeG;
-                        openSet.Enqueue(neighborKey, tentativeG + Heuristic(nx, ny));
+                        openSet.Enqueue((neighborKey, tentativeG), tentativeG + Heuristic(nx, ny));
                     }
                 }
             }
@@ -326,8 +335,9 @@ namespace RunecraftHelper
             byte[] walkableData,
             int bytesPerRow,
             List<Vector2> rawPath,
-            HashSet<(int, int)>? doorOverrides = null)
+            HashSet<(int, int)>? doorOverrides = null, CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (rawPath.Count <= 2)
             {
                 return rawPath;
@@ -341,12 +351,12 @@ namespace RunecraftHelper
                 var farthest = currentIdx + 1;
                 for (var i = rawPath.Count - 1; i > currentIdx; i--)
                 {
-                    var lineResult = LineWalker.CheckLine(
+                    var isClear = LineWalker.IsLineClear(
                         walkableData, bytesPerRow,
                         rawPath[currentIdx], rawPath[i],
-                        doorOverrides);
+                        doorOverrides, cancellationToken);
 
-                    if (lineResult.IsClear)
+                    if (isClear)
                     {
                         farthest = i;
                         break;

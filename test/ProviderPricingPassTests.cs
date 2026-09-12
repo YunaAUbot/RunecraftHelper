@@ -80,14 +80,26 @@ public sealed class ProviderPricingPassTests
         pricing.RequestRefresh();
     }
 
+    [Fact]
+    public void MemoizesWithinPassButRefreshesNextPass()
+    {
+        var provider = new StubProvider { Quote = new PriceQuote(1m, 1m, 3m, "test") };
+        var pass = ProviderPricingPass.Capture(() => provider);
+        for (var i = 0; i < 100; i++) Assert.True(pass.TryGetExaltedPrice("Orb", out _));
+        Assert.Equal(1, provider.PriceCalls);
+        Assert.True(ProviderPricingPass.Capture(() => provider).TryGetExaltedPrice("Orb", out _));
+        Assert.Equal(2, provider.PriceCalls);
+    }
+
     private sealed class StubProvider : IPriceProvider
     {
+        public int PriceCalls { get; private set; }
         public PriceQuery? Query { get; private set; }
         public PriceQuote? Quote { get; init; }
         public string ResolvedName { get; init; } = string.Empty;
         public bool RefreshRequested { get; private set; }
         public PriceProviderStatus Status { get; init; } = new("test", "test", "test", false, 1, DateTimeOffset.UtcNow);
-        public bool TryGetPrice(PriceQuery query, out PriceQuote quote) { Query = query; quote = Quote!; return Quote is not null; }
+        public bool TryGetPrice(PriceQuery query, out PriceQuote quote) { PriceCalls++; Query = query; quote = Quote!; return Quote is not null; }
         public bool TryResolveDisplayName(PriceQuery query, out string displayName) { Query = query; displayName = ResolvedName; return ResolvedName.Length > 0; }
         public bool IsGenericLookupName(string itemName) => false;
         public bool HasPriceDataForName(string itemName) => true;
